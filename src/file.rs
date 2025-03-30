@@ -288,8 +288,9 @@ where Source: Read
                 use InterfaceDescriptionOption::*;
                 use Speed::*;
                 if self.interface_seen {
-                    return LoadError(anyhow!(
-                        "Multiple interfaces are not supported"))
+                    //return LoadError(anyhow!(
+                    //    "Multiple interfaces are not supported"))
+                    return Ignore;
                 } else {
                     self.interface_seen = true;
                 }
