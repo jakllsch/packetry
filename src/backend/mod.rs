@@ -17,6 +17,7 @@ pub use crate::usb::Speed;
 
 pub mod cynthion;
 pub mod ice40usbtrace;
+pub mod usb_sniffer;
 pub mod transfer_queue;
 
 use transfer_queue::TransferQueue;
@@ -31,6 +32,8 @@ static SUPPORTED_DEVICES: Lazy<BTreeMap<VidPid, (&str, ProbeFn)>> = Lazy::new(||
             ("Cynthion", cynthion::probe as ProbeFn)),
         (ice40usbtrace::VID_PID,
             ("iCE40-usbtrace", ice40usbtrace::probe as ProbeFn)),
+        (usb_sniffer::VID_PID,
+            ("usb-sniffer", usb_sniffer::probe as ProbeFn)),
     ])
 );
 
