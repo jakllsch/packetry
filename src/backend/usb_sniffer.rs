@@ -1,11 +1,10 @@
 //! USB capture backend for usb-sniffer.
 
 use std::collections::VecDeque;
-use std::num::NonZeroU32;
 use std::time::Duration;
 use std::sync::mpsc;
 
-use anyhow::{Context as ErrorContext, Error, bail};
+use anyhow::{Context as ErrorContext, Error};
 use num_enum::{IntoPrimitive};
 use nusb::{
     self,
@@ -31,6 +30,7 @@ use super::{
 use crate::capture::CaptureMetadata;
 
 pub const VID_PID: (u16, u16) = (0x6666, 0x6620);
+const INTERFACE: u8 = 0;
 const ENDPOINT: u8 = 0x82;
 const READ_LEN: usize = 0x4000;
 const NUM_TRANSFERS: usize = 4;
@@ -51,16 +51,44 @@ enum CaptureCtrl {
     Test = 4,
 }
 
-/// A UsbSniffer device attached to the system.
-pub struct UsbSnifferDevice {
-    device_info: DeviceInfo,
-    interface_number: u8,
-    alt_setting_number: u8,
-    speeds: Vec<Speed>,
-    metadata: CaptureMetadata,
+bitfield! {
+    pub struct StatusHeader(MSB0 [u8]);
+    impl Debug;
+    u32;
+    pub status, _: 0;        // byte 0 bit 7
+    pub toggle, _: 1;        // byte 0 bit 6
+    pub zero, _: 2;          // byte 0 bit 5
+    pub ts_overflow, _: 3;   // byte 0 bit 4
+    pub ts, _: 23, 4;        // byte 0 bit 3-0, byte 1, byte 2
+    pub speed, _: 25, 24;    // byte 3 bit 1-0
+    pub trigger, _: 26;      // byte 3 bit 2
+    pub vbus, _: 27;         // byte 3 bit 3
+    pub ls, _: 31, 28;       // byte 3 bits 7-4
 }
 
-/// A handle to an open UsbSniffer device.
+bitfield! {
+    pub struct DataHeader(MSB0 [u8]);
+    impl Debug;
+    u32;
+    pub status, _: 0;        // byte 0 bit 7
+    pub toggle, _: 1;        // byte 0 bit 6
+    pub zero, _: 2;          // byte 0 bit 5
+    pub ts_overflow, _: 3;   // byte 0 bit 4
+    pub ts, _: 23, 4;        // byte 0 bit 3-0, byte 1, byte 2
+    //pub unused3, _: 25, 24;  // byte 3 bit 7-6
+    pub data_error, _: 26;   // byte 3 bit 5
+    pub crc_error, _: 27;    // byte 3 bit 4
+    pub overflow, _: 28;     // byte 3 bit 3
+    pub size, _: 39, 29;     // byte 3 bits 2-0, byte 4
+    pub duration, _: 55, 40; // byte 5, byte 6
+}
+
+/// A usb-sniffer device attached to the system.
+pub struct UsbSnifferDevice {
+    device_info: DeviceInfo,
+}
+
+/// A handle to an open usb-sniffer device.
 #[derive(Clone)]
 pub struct UsbSnifferHandle {
     interface: Interface,
@@ -86,91 +114,35 @@ fn clk_to_ns(clk_cycles: u64) -> u64 {
     quotient * 50 + TABLE[remainder as usize]
 }
 
-/// Probe a UsbSniffer device.
+/// Probe a usb-sniffer device.
 pub fn probe(device_info: DeviceInfo) -> Result<Box<dyn BackendDevice>, Error> {
     Ok(Box::new(UsbSnifferDevice::new(device_info)?))
 }
 
 impl UsbSnifferDevice {
-    /// Check whether a UsbSniffer device has an accessible analyzer interface.
+    /// Check whether a usb-sniffer device has an accessible analyzer interface.
     pub fn new(device_info: DeviceInfo) -> Result<UsbSnifferDevice, Error> {
 
         // Check we can open the device.
-        let device = device_info
+        let _device = device_info
             .open()
             .context("Failed to open device")?;
 
-        // Read the active configuration.
-        let config = device
-            .active_configuration()
-            .context("Failed to retrieve active configuration")?;
-
-        // Iterate over the interfaces...
-        for interface in config.interfaces() {
-            let interface_number = interface.interface_number();
-
-            // ...and alternate settings...
-            for alt_setting in interface.alt_settings() {
-                let alt_setting_number = alt_setting.alternate_setting();
-
-                // Try to claim the interface.
-                let interface = device
-                    .claim_interface(interface_number)
-                    .context("Failed to claim interface")?;
-
-                // Select the required alternate, if not the default.
-                if alt_setting_number != 0 {
-                    interface
-                        .set_alt_setting(alt_setting_number)
-                        .context("Failed to select alternate setting")?;
-                }
-
-                let metadata = CaptureMetadata {
-                    iface_desc: Some("UsbSniffer USB Analyzer".to_string()),
-                    iface_hardware: Some({
-                        let bcd = device_info.device_version();
-                        let major = bcd >> 8;
-                        let minor = bcd as u8;
-                        format!("UsbSniffer r{major}.{minor}")
-                    }),
-                    iface_os: Some(
-                        format!("usb-sniffer")),
-                    iface_snaplen: Some(NonZeroU32::new(0xFFFF).unwrap()),
-                    .. Default::default()
-                };
-
-                // Fetch the available speeds.
-                let handle = UsbSnifferHandle { interface, metadata };
-                let speeds = handle
-                    .speeds()
-                    .context("Failed to fetch available speeds")?;
-
-                // Now we have a usable device.
-                return Ok(
-                    UsbSnifferDevice {
-                        device_info,
-                        interface_number,
-                        alt_setting_number,
-                        speeds,
-                        metadata: handle.metadata,
-                    }
-                )
-            }
-        }
-
-        bail!("No supported analyzer interface found");
+        // Now we have a usable device.
+        Ok(UsbSnifferDevice {device_info} )
     }
 
     /// Open this device.
     pub fn open(&self) -> Result<UsbSnifferHandle, Error> {
         let device = self.device_info.open()?;
-        let interface = device.claim_interface(self.interface_number)?;
-        if self.alt_setting_number != 0 {
-            interface.set_alt_setting(self.alt_setting_number)?;
-        }
+        let interface = device.claim_interface(INTERFACE)?;
+        let metadata = CaptureMetadata {
+            iface_desc: Some("usb-sniffer USB Analyzer".to_string()),
+            .. Default::default()
+        };
         Ok(UsbSnifferHandle {
             interface,
-            metadata: self.metadata.clone()
+            metadata,
         })
     }
 }
@@ -181,7 +153,8 @@ impl BackendDevice for UsbSnifferDevice {
     }
 
     fn supported_speeds(&self) -> &[Speed] {
-        &self.speeds
+        use Speed::*;
+        &[Auto, High, Full, Low]
     }
 }
 
@@ -233,54 +206,41 @@ impl BackendHandle for UsbSnifferHandle {
 
 impl UsbSnifferHandle {
 
-    fn speeds(&self) -> Result<Vec<Speed>, Error> {
-        use Speed::*;
-        let mut speeds = Vec::new();
-        for speed in [Auto, High, Full, Low] {
-            if true {
-                speeds.push(speed);
-            }
-        }
-        Ok(speeds)
-    }
-
     fn start_capture (&mut self, speed: Speed) -> Result<(), Error> {
-        let _ = self.ctrl_init();
-        let _ = self.cmd_ctrl(CaptureCtrl::Enable, 0);
-        let _ = self.cmd_ctrl(CaptureCtrl::Reset, 1);
+        self.ctrl_init()?;
+        self.cmd_ctrl(CaptureCtrl::Enable, 0)?;
+        self.cmd_ctrl(CaptureCtrl::Reset, 1)?;
         // flush_data???
-        
         if speed == Speed::High {
-            let _ = self.cmd_ctrl(CaptureCtrl::Speed0, 0);
-            let _ = self.cmd_ctrl(CaptureCtrl::Speed1, 1);
+            self.cmd_ctrl(CaptureCtrl::Speed0, 0)?;
+            self.cmd_ctrl(CaptureCtrl::Speed1, 1)?;
         } else if speed == Speed::Full {
-            let _ = self.cmd_ctrl(CaptureCtrl::Speed0, 1);
-            let _ = self.cmd_ctrl(CaptureCtrl::Speed1, 0);
+            self.cmd_ctrl(CaptureCtrl::Speed0, 1)?;
+            self.cmd_ctrl(CaptureCtrl::Speed1, 0)?;
         } else if speed == Speed::Low {
-            let _ = self.cmd_ctrl(CaptureCtrl::Speed0, 0);
-            let _ = self.cmd_ctrl(CaptureCtrl::Speed1, 0);
+            self.cmd_ctrl(CaptureCtrl::Speed0, 0)?;
+            self.cmd_ctrl(CaptureCtrl::Speed1, 0)?;
         } else {
-            let _ = self.cmd_ctrl(CaptureCtrl::Speed0, 1);
-            let _ = self.cmd_ctrl(CaptureCtrl::Speed1, 1);
+            self.cmd_ctrl(CaptureCtrl::Speed0, 1)?;
+            self.cmd_ctrl(CaptureCtrl::Speed1, 1)?;
         }
-        let _ = self.cmd_ctrl(CaptureCtrl::Reset, 0);
-        let _ = self.cmd_ctrl(CaptureCtrl::Enable, 1);
-        Ok(())
+        self.cmd_ctrl(CaptureCtrl::Reset, 0)?;
+        self.cmd_ctrl(CaptureCtrl::Enable, 1)
     }
 
     fn stop_capture(&mut self) -> Result<(), Error> {
-        let _ = self.cmd_ctrl(CaptureCtrl::Enable, 0);
+        self.cmd_ctrl(CaptureCtrl::Enable, 0)?;
         self.cmd_ctrl(CaptureCtrl::Reset, 1)
     }
 
     fn ctrl_init(&mut self) -> Result<(), Error> {
-        let _ = self.cmd_ctrl(CaptureCtrl::Reset, 1);
-        let _ = self.cmd_ctrl(CaptureCtrl::Enable, 0);
-        let _ = self.cmd_ctrl(CaptureCtrl::Test, 0);
-        let _ = self.cmd_ctrl(CaptureCtrl::Speed0, 1);
-        let _ = self.cmd_ctrl(CaptureCtrl::Speed0, 0);
-        let _ = self.cmd_ctrl(CaptureCtrl::Speed1, 1);
-        let _ = self.cmd_ctrl(CaptureCtrl::Speed1, 0);
+        self.cmd_ctrl(CaptureCtrl::Reset, 1)?;
+        self.cmd_ctrl(CaptureCtrl::Enable, 0)?;
+        self.cmd_ctrl(CaptureCtrl::Test, 0)?;
+        self.cmd_ctrl(CaptureCtrl::Speed0, 1)?;
+        self.cmd_ctrl(CaptureCtrl::Speed0, 0)?;
+        self.cmd_ctrl(CaptureCtrl::Speed1, 1)?;
+        self.cmd_ctrl(CaptureCtrl::Speed1, 0)?;
         Ok(())
     }
 
@@ -294,7 +254,7 @@ impl UsbSnifferHandle {
             recipient: Recipient::Device,
             request: Command::Ctrl.into(),
             value: wvalue,
-            index: 0 as u16,
+            index: 0,
         };
         let data = &[];
         let timeout = Duration::from_secs(1);
@@ -303,7 +263,6 @@ impl UsbSnifferHandle {
             .context("Write request failed")?;
         Ok(())
     }
-
 }
 
 impl PacketIterator for UsbSnifferStream {}
@@ -333,7 +292,7 @@ impl UsbSnifferStream {
 
         // Loop over any non-packet events, until we get to a packet.
         loop {
-            if self.buffer.len() < 1 {
+            if self.buffer.is_empty() {
                 return None
             }
             //println!("{} {} {} {} {}", self.capture_header, self.buffer.len(), self.capture_status, self.buffer[0], self.capture_size);
@@ -351,19 +310,28 @@ impl UsbSnifferStream {
             }
 
             if self.capture_header {
-                let ts = u32::from_be_bytes([0 as u8, self.buffer[0] & 0xf as u8, self.buffer[1] as u8, self.buffer[2] as u8]) as u64;
-                if self.buffer[0] & 0x10 != 0 {
+                let statusheader = StatusHeader(self.buffer.range(0..4).copied().collect::<Vec<u8>>());
+                let ts = u32::from_be_bytes([0, self.buffer[0] & 0xf, self.buffer[1], self.buffer[2]]) as u64;
+                if statusheader.ts_overflow() {
+                    assert!(self.buffer[0] & 0x10 != 0);
                     self.total_clk_cycles += 0x100000;
                 }
-                self.ts = self.total_clk_cycles + ts;
+                self.ts = self.total_clk_cycles + statusheader.ts() as u64;
                 if self.capture_status {
+                    assert!(!statusheader.status());
+                    //println!("{:?}", statusheader);
+                    assert_eq!(statusheader.ts() as u64, ts);
                     self.buffer.drain(0..self.capture_size);
                 } else {
+                    let dataheader = DataHeader(self.buffer.range(0..7).copied().collect::<Vec<u8>>());
+                    assert_eq!(dataheader.ts() as u64, ts);
+                    //println!("{:?}", dataheader);
                     let packet_len = u16::from_be_bytes(
                         [self.buffer[3] & 0x7, self.buffer[4]]) as usize;
                     //println!("be {}", packet_len);
-                    self.buffer.drain(0..7);
-                    self.capture_size = packet_len - 7;
+                    assert_eq!(dataheader.size() as usize, packet_len);
+                    self.buffer.drain(0..self.capture_size);
+                    self.capture_size = dataheader.size() as usize - 7;
                     //println!("capture size {}", self.capture_size);
                     self.capture_header = 0 == self.capture_size;
                 }
@@ -377,5 +345,29 @@ impl UsbSnifferStream {
             timestamp_ns: clk_to_ns(self.ts),
             bytes: self.buffer.drain(0..self.capture_size).collect()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_statusheader() {
+        let data: [u8; 4] = [0x98, 0x76, 0x54, 0x32];
+        let statusheader = StatusHeader(&data);
+
+        println!("statusheader {:?}", statusheader);
+        assert_eq!(statusheader.ts(), 0x87654);
+    }
+    #[test]
+    fn test_dataheader() {
+        let data: [u8; 7] = [0x98, 0x76, 0x54, 0x32, 0x10, 0xfe, 0xdc];
+        let dataheader = DataHeader(&data);
+
+        println!("dataheader {:?}", dataheader);
+        assert_eq!(dataheader.ts(), 0x87654);
+        assert_eq!(dataheader.size(), 0x210);
+        assert_eq!(dataheader.duration(), 0xfedc);
     }
 }
