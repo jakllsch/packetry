@@ -4,26 +4,31 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use std::sync::mpsc;
 
-use anyhow::{Context as ErrorContext, Error};
+use anyhow::{Context as ErrorContext, Error, bail};
 use num_enum::{IntoPrimitive};
 use nusb::{
     self,
     transfer::{
-        Control,
+        Buffer,
+        Bulk,
+        ControlOut,
         ControlType,
+        In,
         Recipient,
     },
     DeviceInfo,
-    Interface
+    Interface,
+    MaybeFuture,
 };
 
 use super::{
     BackendDevice,
     BackendHandle,
+    EventIterator,
+    EventResult,
+    PowerConfig,
     Speed,
-    PacketIterator,
-    PacketResult,
-    TimestampedPacket,
+    TimestampedEvent,
     TransferQueue,
 };
 
@@ -97,7 +102,8 @@ pub struct UsbSnifferHandle {
 
 /// Converts from received data bytes to timestamped packets.
 pub struct UsbSnifferStream {
-    receiver: mpsc::Receiver<Vec<u8>>,
+    data_rx: mpsc::Receiver<Buffer>,
+    reuse_tx: mpsc::Sender<Buffer>,
     buffer: VecDeque<u8>,
     capture_header: bool,
     capture_status: bool,
@@ -126,6 +132,7 @@ impl UsbSnifferDevice {
         // Check we can open the device.
         let _device = device_info
             .open()
+            .wait()
             .context("Failed to open device")?;
 
         // Now we have a usable device.
@@ -134,8 +141,13 @@ impl UsbSnifferDevice {
 
     /// Open this device.
     pub fn open(&self) -> Result<UsbSnifferHandle, Error> {
-        let device = self.device_info.open()?;
-        let interface = device.claim_interface(INTERFACE)?;
+        let device = self.device_info
+            .open()
+            .wait()
+            .context("Failed to open device")?;
+        let interface = device.claim_interface(INTERFACE)
+            .wait()
+            .context("Failed to claim interface")?;
         let metadata = CaptureMetadata {
             iface_desc: Some("usb-sniffer USB Analyzer".to_string()),
             .. Default::default()
@@ -152,27 +164,44 @@ impl BackendDevice for UsbSnifferDevice {
         Ok(Box::new(self.open()?))
     }
 
+}
+
+impl BackendHandle for UsbSnifferHandle {
     fn supported_speeds(&self) -> &[Speed] {
         use Speed::*;
         &[Auto, High, Full, Low]
     }
-}
 
-impl BackendHandle for UsbSnifferHandle {
     fn metadata(&self) -> &CaptureMetadata {
         &self.metadata
+    }
+
+    fn power_sources(&self) -> Option<&[&str]> {
+        None
+    }
+
+    fn power_config(&self) -> Option<PowerConfig> {
+        None
+    }
+
+    fn set_power_config(&mut self, _config: PowerConfig) -> Result<(), Error> {
+        Ok(())
     }
 
     fn begin_capture(
         &mut self,
         speed: Speed,
-        data_tx: mpsc::Sender<Vec<u8>>
+        data_tx: mpsc::Sender<Buffer>
     ) -> Result<TransferQueue, Error>
     {
+        let endpoint = match self.interface.endpoint::<Bulk, In>(ENDPOINT) {
+            Ok(endpoint) => endpoint,
+            Err(_) => bail!("Failed to claim endpoint {ENDPOINT}"),
+        };
+
         self.start_capture(speed)?;
 
-        Ok(TransferQueue::new(&self.interface, data_tx,
-            ENDPOINT, NUM_TRANSFERS, READ_LEN))
+        Ok(TransferQueue::new(endpoint, data_tx, NUM_TRANSFERS, READ_LEN))
     }
 
     fn end_capture(&mut self) -> Result<(), Error> {
@@ -183,12 +212,15 @@ impl BackendHandle for UsbSnifferHandle {
         Ok(())
     }
 
-    fn timestamped_packets(&self, data_rx: mpsc::Receiver<Vec<u8>>)
-        -> Box<dyn PacketIterator>
-    {
+    fn timestamped_events(
+        &self,
+        data_rx: mpsc::Receiver<Buffer>,
+        reuse_tx: mpsc::Sender<Buffer>,
+    ) -> Box<dyn EventIterator> {
         Box::new(
             UsbSnifferStream {
-                receiver: data_rx,
+                data_rx,
+                reuse_tx,
                 buffer: VecDeque::new(),
                 capture_header: true,
                 capture_status: false,
@@ -249,36 +281,40 @@ impl UsbSnifferHandle {
         if value > 0 {
             wvalue |= 0x0010;
         }
-        let control = Control {
+        let control = ControlOut {
             control_type: ControlType::Vendor,
             recipient: Recipient::Device,
             request: Command::Ctrl.into(),
             value: wvalue,
             index: 0,
+            data: &[],
         };
-        let data = &[];
         let timeout = Duration::from_secs(1);
         self.interface
-            .control_out_blocking(control, data, timeout)
+            .control_out(control, timeout).wait()
             .context("Write request failed")?;
         Ok(())
     }
 }
 
-impl PacketIterator for UsbSnifferStream {}
+impl EventIterator for UsbSnifferStream {}
 
 impl Iterator for UsbSnifferStream {
-    type Item = PacketResult;
-    fn next(&mut self) -> Option<PacketResult> {
+    type Item = EventResult;
+    fn next(&mut self) -> Option<EventResult> {
         loop {
             // Do we have another packet already in the buffer?
             match self.next_buffered_packet() {
                 // Yes; return the packet.
                 Some(packet) => return Some(Ok(packet)),
                 // No; wait for more data from the capture thread.
-                None => match self.receiver.recv().ok() {
+                None => match self.data_rx.recv().ok() {
                     // Received more data; add it to the buffer and retry.
-                    Some(bytes) => self.buffer.extend(bytes.iter()),
+                    Some(buffer) => {
+                        self.buffer.extend(buffer.iter());
+                        // Buffer can now be reused.
+                        let _ = self.reuse_tx.send(buffer);
+                    },
                     // Capture has ended, there are no more packets.
                     None => return None
                 }
@@ -288,7 +324,9 @@ impl Iterator for UsbSnifferStream {
 }
 
 impl UsbSnifferStream {
-    fn next_buffered_packet(&mut self) -> Option<TimestampedPacket> {
+    fn next_buffered_packet(&mut self) -> Option<TimestampedEvent> {
+
+        use TimestampedEvent::Packet;
 
         // Loop over any non-packet events, until we get to a packet.
         loop {
@@ -341,7 +379,7 @@ impl UsbSnifferStream {
             }
         }
 
-        Some(TimestampedPacket {
+        Some(Packet {
             timestamp_ns: clk_to_ns(self.ts),
             bytes: self.buffer.drain(0..self.capture_size).collect()
         })
