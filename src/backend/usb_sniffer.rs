@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::sync::mpsc;
 
 use anyhow::{Context as ErrorContext, Error, bail};
+use async_trait::async_trait;
 use num_enum::{IntoPrimitive};
 use nusb::{
     self,
@@ -18,7 +19,6 @@ use nusb::{
     },
     DeviceInfo,
     Interface,
-    MaybeFuture,
 };
 
 use super::{
@@ -89,6 +89,7 @@ bitfield! {
 }
 
 /// A usb-sniffer device attached to the system.
+#[derive(Clone)]
 pub struct UsbSnifferDevice {
     device_info: DeviceInfo,
 }
@@ -122,31 +123,19 @@ fn clk_to_ns(clk_cycles: u64) -> u64 {
 
 /// Probe a usb-sniffer device.
 pub fn probe(device_info: DeviceInfo) -> Result<Box<dyn BackendDevice>, Error> {
-    Ok(Box::new(UsbSnifferDevice::new(device_info)?))
+    Ok(Box::new(UsbSnifferDevice { device_info }))
 }
 
 impl UsbSnifferDevice {
-    /// Check whether a usb-sniffer device has an accessible analyzer interface.
-    pub fn new(device_info: DeviceInfo) -> Result<UsbSnifferDevice, Error> {
-
-        // Check we can open the device.
-        let _device = device_info
-            .open()
-            .wait()
-            .context("Failed to open device")?;
-
-        // Now we have a usable device.
-        Ok(UsbSnifferDevice {device_info} )
-    }
-
     /// Open this device.
-    pub fn open(&self) -> Result<UsbSnifferHandle, Error> {
+    pub async fn open(&self) -> Result<UsbSnifferHandle, Error> {
         let device = self.device_info
             .open()
-            .wait()
+            .await
             .context("Failed to open device")?;
-        let interface = device.claim_interface(INTERFACE)
-            .wait()
+        let interface = device
+            .claim_interface(INTERFACE)
+            .await
             .context("Failed to claim interface")?;
         let metadata = CaptureMetadata {
             iface_desc: Some("usb-sniffer USB Analyzer".to_string()),
@@ -159,13 +148,18 @@ impl UsbSnifferDevice {
     }
 }
 
+#[async_trait]
 impl BackendDevice for UsbSnifferDevice {
-    fn open_as_generic(&self) -> Result<Box<dyn BackendHandle>, Error> {
-        Ok(Box::new(self.open()?))
+    async fn open_as_generic(&self) -> Result<Box<dyn BackendHandle>, Error> {
+        Ok(Box::new(self.open().await?))
     }
 
+    fn duplicate(&self) -> Box<dyn BackendDevice> {
+        Box::new(self.clone())
+    }
 }
 
+#[async_trait(?Send)]
 impl BackendHandle for UsbSnifferHandle {
     fn supported_speeds(&self) -> &[Speed] {
         use Speed::*;
@@ -180,15 +174,17 @@ impl BackendHandle for UsbSnifferHandle {
         None
     }
 
-    fn power_config(&self) -> Option<PowerConfig> {
+    async fn power_config(&self) -> Option<PowerConfig> {
         None
     }
 
-    fn set_power_config(&mut self, _config: PowerConfig) -> Result<(), Error> {
+    async fn set_power_config(&mut self, _config: PowerConfig)
+        -> Result<(), Error>
+    {
         Ok(())
     }
 
-    fn begin_capture(
+    async fn begin_capture(
         &mut self,
         speed: Speed,
         data_tx: mpsc::Sender<Buffer>
@@ -199,16 +195,16 @@ impl BackendHandle for UsbSnifferHandle {
             Err(_) => bail!("Failed to claim endpoint {ENDPOINT}"),
         };
 
-        self.start_capture(speed)?;
+        self.start_capture(speed).await?;
 
         Ok(TransferQueue::new(endpoint, data_tx, NUM_TRANSFERS, READ_LEN))
     }
 
-    fn end_capture(&mut self) -> Result<(), Error> {
-        self.stop_capture()
+    async fn end_capture(&mut self) -> Result<(), Error> {
+        self.stop_capture().await
     }
 
-    fn post_capture(&mut self) -> Result<(), Error> {
+    async fn post_capture(&mut self) -> Result<(), Error> {
         Ok(())
     }
 
@@ -238,45 +234,45 @@ impl BackendHandle for UsbSnifferHandle {
 
 impl UsbSnifferHandle {
 
-    fn start_capture (&mut self, speed: Speed) -> Result<(), Error> {
-        self.ctrl_init()?;
-        self.cmd_ctrl(CaptureCtrl::Enable, 0)?;
-        self.cmd_ctrl(CaptureCtrl::Reset, 1)?;
+    async fn start_capture (&mut self, speed: Speed) -> Result<(), Error> {
+        self.ctrl_init().await?;
+        self.cmd_ctrl(CaptureCtrl::Enable, 0).await?;
+        self.cmd_ctrl(CaptureCtrl::Reset, 1).await?;
         // flush_data???
         if speed == Speed::High {
-            self.cmd_ctrl(CaptureCtrl::Speed0, 0)?;
-            self.cmd_ctrl(CaptureCtrl::Speed1, 1)?;
+            self.cmd_ctrl(CaptureCtrl::Speed0, 0).await?;
+            self.cmd_ctrl(CaptureCtrl::Speed1, 1).await?;
         } else if speed == Speed::Full {
-            self.cmd_ctrl(CaptureCtrl::Speed0, 1)?;
-            self.cmd_ctrl(CaptureCtrl::Speed1, 0)?;
+            self.cmd_ctrl(CaptureCtrl::Speed0, 1).await?;
+            self.cmd_ctrl(CaptureCtrl::Speed1, 0).await?;
         } else if speed == Speed::Low {
-            self.cmd_ctrl(CaptureCtrl::Speed0, 0)?;
-            self.cmd_ctrl(CaptureCtrl::Speed1, 0)?;
+            self.cmd_ctrl(CaptureCtrl::Speed0, 0).await?;
+            self.cmd_ctrl(CaptureCtrl::Speed1, 0).await?;
         } else {
-            self.cmd_ctrl(CaptureCtrl::Speed0, 1)?;
-            self.cmd_ctrl(CaptureCtrl::Speed1, 1)?;
+            self.cmd_ctrl(CaptureCtrl::Speed0, 1).await?;
+            self.cmd_ctrl(CaptureCtrl::Speed1, 1).await?;
         }
-        self.cmd_ctrl(CaptureCtrl::Reset, 0)?;
-        self.cmd_ctrl(CaptureCtrl::Enable, 1)
+        self.cmd_ctrl(CaptureCtrl::Reset, 0).await?;
+        self.cmd_ctrl(CaptureCtrl::Enable, 1).await
     }
 
-    fn stop_capture(&mut self) -> Result<(), Error> {
-        self.cmd_ctrl(CaptureCtrl::Enable, 0)?;
-        self.cmd_ctrl(CaptureCtrl::Reset, 1)
+    async fn stop_capture(&mut self) -> Result<(), Error> {
+        self.cmd_ctrl(CaptureCtrl::Enable, 0).await?;
+        self.cmd_ctrl(CaptureCtrl::Reset, 1).await
     }
 
-    fn ctrl_init(&mut self) -> Result<(), Error> {
-        self.cmd_ctrl(CaptureCtrl::Reset, 1)?;
-        self.cmd_ctrl(CaptureCtrl::Enable, 0)?;
-        self.cmd_ctrl(CaptureCtrl::Test, 0)?;
-        self.cmd_ctrl(CaptureCtrl::Speed0, 1)?;
-        self.cmd_ctrl(CaptureCtrl::Speed0, 0)?;
-        self.cmd_ctrl(CaptureCtrl::Speed1, 1)?;
-        self.cmd_ctrl(CaptureCtrl::Speed1, 0)?;
+    async fn ctrl_init(&mut self) -> Result<(), Error> {
+        self.cmd_ctrl(CaptureCtrl::Reset, 1).await?;
+        self.cmd_ctrl(CaptureCtrl::Enable, 0).await?;
+        self.cmd_ctrl(CaptureCtrl::Test, 0).await?;
+        self.cmd_ctrl(CaptureCtrl::Speed0, 1).await?;
+        self.cmd_ctrl(CaptureCtrl::Speed0, 0).await?;
+        self.cmd_ctrl(CaptureCtrl::Speed1, 1).await?;
+        self.cmd_ctrl(CaptureCtrl::Speed1, 0).await?;
         Ok(())
     }
 
-    fn cmd_ctrl(&mut self, index: CaptureCtrl, value: u8) -> Result<(), Error> {
+    async fn cmd_ctrl(&mut self, index: CaptureCtrl, value: u8) -> Result<(), Error> {
         let mut wvalue = index as u16;
         if value > 0 {
             wvalue |= 0x0010;
@@ -291,7 +287,7 @@ impl UsbSnifferHandle {
         };
         let timeout = Duration::from_secs(1);
         self.interface
-            .control_out(control, timeout).wait()
+            .control_out(control, timeout).await
             .context("Write request failed")?;
         Ok(())
     }
